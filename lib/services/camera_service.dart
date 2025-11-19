@@ -14,10 +14,10 @@ class CameraService {
     options: FaceDetectorOptions(
       enableContours: true,
       enableLandmarks: true,
-      enableClassification: true,
+      enableClassification: true, // Required for eye open/closed detection
       enableTracking: true, // Enable tracking for better performance
-      performanceMode: FaceDetectorMode.fast, // Try fast mode for better compatibility
-      minFaceSize: 0.05, // Very small minimum face size for maximum sensitivity
+      performanceMode: FaceDetectorMode.accurate, // Use accurate mode for better detection
+      minFaceSize: 0.15, // Minimum face size (15% of image) - balanced for performance and accuracy
     ),
   );
   
@@ -30,8 +30,8 @@ class CameraService {
     
     _cameraController = CameraController(
       frontCamera,
-      ResolutionPreset.high, // High resolution for better detection (veryHigh might be too much)
-      imageFormatGroup: ImageFormatGroup.yuv420,
+      ResolutionPreset.high, // High resolution for better detection
+      imageFormatGroup: ImageFormatGroup.yuv420, // YUV420 format for ML Kit
       enableAudio: false,
     );
     
@@ -68,27 +68,53 @@ class CameraService {
         
         final faces = await _faceDetector.processImage(inputImage);
         
+        final isDrowsy = _checkForDrowsiness(faces);
+        final bothEyesClosed = _areBothEyesClosed(faces);
+        
+        // Calculate eye openness percentage (0-100%)
+        // leftEyeOpenProbability: 0.0 = closed, 1.0 = open
+        double leftEyePercent = 0.0;
+        double rightEyePercent = 0.0;
+        
+        if (faces.isNotEmpty) {
+          final face = faces.first;
+          final leftEyeProb = face.leftEyeOpenProbability;
+          final rightEyeProb = face.rightEyeOpenProbability;
+          
+          // Convert probability to percentage
+          // If probability is null, assume 100% open (default safe state)
+          leftEyePercent = leftEyeProb != null 
+              ? (leftEyeProb.clamp(0.0, 1.0) * 100)
+              : 100.0;
+          rightEyePercent = rightEyeProb != null
+              ? (rightEyeProb.clamp(0.0, 1.0) * 100)
+              : 100.0;
+        }
+        
         // Debug logging (only log occasionally to avoid spam)
         _frameCount++;
-        if (_frameCount % 30 == 0) { // Log every 30 frames (~1 second at 30fps)
-          debugPrint('Face detection: ${faces.length} face(s) found');
+        if (_frameCount % 60 == 0) { // Log every 60 frames (~2 seconds at 30fps)
+          debugPrint('=== Face Detection Debug ===');
+          debugPrint('Frame count: $_frameCount');
+          debugPrint('Faces detected: ${faces.length}');
           if (faces.isNotEmpty) {
             final face = faces.first;
             debugPrint('Face bounds: ${face.boundingBox}');
-            debugPrint('Left eye open: ${face.leftEyeOpenProbability}, Right eye open: ${face.rightEyeOpenProbability}');
+            debugPrint('Face size: ${face.boundingBox.width}x${face.boundingBox.height}');
+            debugPrint('Left eye open probability: ${face.leftEyeOpenProbability}');
+            debugPrint('Right eye open probability: ${face.rightEyeOpenProbability}');
+            debugPrint('Is drowsy: $isDrowsy');
+            debugPrint('Both eyes closed: $bothEyesClosed');
+            debugPrint('Eye percentages - Left: ${leftEyePercent.toStringAsFixed(1)}%, Right: ${rightEyePercent.toStringAsFixed(1)}%');
           } else {
-            debugPrint('No faces detected - check image format and rotation');
+            debugPrint('No faces detected');
+            debugPrint('Image size: ${image.width}x${image.height}');
+            debugPrint('Image format: ${image.format}');
+            debugPrint('Rotation: $rotation');
+            debugPrint('Tip: Ensure face is well-lit and centered in frame');
           }
+          debugPrint('===========================');
         }
-        
-        final isDrowsy = _checkForDrowsiness(faces);
-        final bothEyesClosed = _areBothEyesClosed(faces);
-        final leftEyePercent = faces.isNotEmpty
-            ? ((faces.first.leftEyeOpenProbability ?? 0).clamp(0.0, 1.0) * 100)
-            : 0.0;
-        final rightEyePercent = faces.isNotEmpty
-            ? ((faces.first.rightEyeOpenProbability ?? 0).clamp(0.0, 1.0) * 100)
-            : 0.0;
         
         onDetectionResult(
           FaceDetectionResult(
@@ -125,37 +151,83 @@ class CameraService {
       
       final size = Size(image.width.toDouble(), image.height.toDouble());
       
-      // For YUV420 format, combine all planes into a single byte array
-      // Calculate total size needed
-      int totalBytes = 0;
-      for (final Plane plane in image.planes) {
-        totalBytes += plane.bytes.length;
+      // Convert YUV_420_888 format to NV21 format for ML Kit
+      // YUV_420_888 has 3 planes: Y (luminance), U (chroma), V (chroma)
+      if (image.planes.isEmpty) {
+        debugPrint('Error: Image planes are empty');
+        return null;
       }
       
-      final bytes = Uint8List(totalBytes);
-      int offset = 0;
-      for (final Plane plane in image.planes) {
-        bytes.setRange(offset, offset + plane.bytes.length, plane.bytes);
-        offset += plane.bytes.length;
+      final yPlane = image.planes[0];
+      final uPlane = image.planes.length > 1 ? image.planes[1] : null;
+      final vPlane = image.planes.length > 2 ? image.planes[2] : null;
+      
+      // For YUV_420_888, we need to convert to NV21 format
+      // NV21: Y plane followed by interleaved VU plane
+      final yBuffer = yPlane.bytes;
+      final yRowStride = yPlane.bytesPerRow;
+      final yPixelStride = yPlane.bytesPerPixel ?? 1;
+      
+      // Calculate image dimensions
+      final width = image.width;
+      final height = image.height;
+      
+      // Create NV21 buffer (Y plane + interleaved VU)
+      final nv21Size = (width * height * 3 / 2).round();
+      final nv21 = Uint8List(nv21Size);
+      
+      // Copy Y plane - handle pixel stride correctly
+      int nv21Index = 0;
+      for (int row = 0; row < height; row++) {
+        int yStart = row * yRowStride;
+        for (int col = 0; col < width; col++) {
+          int yPos = yStart + col * yPixelStride;
+          if (yPos < yBuffer.length) {
+            nv21[nv21Index++] = yBuffer[yPos];
+          }
+        }
       }
       
-      // Determine the correct image format from raw value
-      final imageFormat = InputImageFormatValue.fromRawValue(image.format.raw) ??
-          InputImageFormat.nv21;
-      
-      // Get bytesPerRow from the first plane (Y plane for YUV420)
-      // This is critical for proper image interpretation
-      final bytesPerRow = image.planes[0].bytesPerRow;
+      // Convert UV planes to interleaved VU format (NV21)
+      if (uPlane != null && vPlane != null) {
+        final uBuffer = uPlane.bytes;
+        final vBuffer = vPlane.bytes;
+        final uvRowStride = uPlane.bytesPerRow;
+        final uvPixelStride = uPlane.bytesPerPixel ?? 1;
+        
+        final uvWidth = width ~/ 2;
+        final uvHeight = height ~/ 2;
+        
+        int uvIndex = width * height; // Start after Y plane
+        
+        for (int row = 0; row < uvHeight; row++) {
+          int uRowStart = row * uvRowStride;
+          int vRowStart = row * vPlane.bytesPerRow;
+          final vPixelStride = vPlane.bytesPerPixel ?? 1;
+          
+          for (int col = 0; col < uvWidth; col++) {
+            int uPos = uRowStart + col * uvPixelStride;
+            int vPos = vRowStart + col * vPixelStride;
+            
+            // Ensure we don't go out of bounds
+            if (vPos < vBuffer.length && uPos < uBuffer.length && uvIndex < nv21.length - 1) {
+              // Interleave as VU (NV21 format)
+              nv21[uvIndex++] = vBuffer[vPos];
+              nv21[uvIndex++] = uBuffer[uPos];
+            }
+          }
+        }
+      }
       
       final metadata = InputImageMetadata(
         size: size,
         rotation: rotation,
-        format: imageFormat,
-        bytesPerRow: bytesPerRow,
+        format: InputImageFormat.nv21,
+        bytesPerRow: width, // For NV21, bytesPerRow is width
       );
       
       return InputImage.fromBytes(
-        bytes: bytes,
+        bytes: nv21,
         metadata: metadata,
       );
     } catch (e, stackTrace) {
@@ -170,33 +242,45 @@ class CameraService {
     
     final face = faces.first;
     
-    // More accurate thresholds with better handling of edge cases
-    final leftEyeOpen = face.leftEyeOpenProbability ?? 1.0;
-    final rightEyeOpen = face.rightEyeOpenProbability ?? 1.0;
+    // Get eye open probabilities (0.0 = closed, 1.0 = open)
+    // If probability is null, assume eye is open (default)
+    final leftEyeOpen = face.leftEyeOpenProbability;
+    final rightEyeOpen = face.rightEyeOpenProbability;
     
-    // Both eyes closed - most reliable indicator
-    final bothEyesClosed = leftEyeOpen < 0.25 && rightEyeOpen < 0.25;
+    // If eye classification is not available, return false
+    if (leftEyeOpen == null || rightEyeOpen == null) {
+      return false;
+    }
+    
+    // Both eyes closed - most reliable indicator of drowsiness
+    final bothEyesClosed = leftEyeOpen < 0.3 && rightEyeOpen < 0.3;
+    
+    // Both eyes partially closed (drowsy state) - eyes are less than 50% open
+    final bothEyesPartiallyClosed = leftEyeOpen < 0.5 && rightEyeOpen < 0.5;
     
     // One eye significantly more closed than the other (winking or squinting)
-    final oneEyeClosed = (leftEyeOpen < 0.2 && rightEyeOpen < 0.4) ||
-        (leftEyeOpen < 0.4 && rightEyeOpen < 0.2);
+    final eyeDifference = (leftEyeOpen - rightEyeOpen).abs();
+    final oneEyeClosed = eyeDifference > 0.4 && 
+        (leftEyeOpen < 0.3 || rightEyeOpen < 0.3);
     
-    // Both eyes partially closed (drowsy state)
-    final bothEyesPartiallyClosed = leftEyeOpen < 0.3 && rightEyeOpen < 0.3;
-    
-    return bothEyesClosed || oneEyeClosed || bothEyesPartiallyClosed;
+    return bothEyesClosed || (bothEyesPartiallyClosed && !oneEyeClosed) || oneEyeClosed;
   }
   
   bool _areBothEyesClosed(List<Face> faces) {
     if (faces.isEmpty) return false;
     
     final face = faces.first;
-    final leftEyeOpen = face.leftEyeOpenProbability ?? 1.0;
-    final rightEyeOpen = face.rightEyeOpenProbability ?? 1.0;
+    final leftEyeOpen = face.leftEyeOpenProbability;
+    final rightEyeOpen = face.rightEyeOpenProbability;
     
-    // More strict threshold for "both eyes closed" detection
-    // Using 0.25 threshold for better accuracy
-    return leftEyeOpen < 0.25 && rightEyeOpen < 0.25;
+    // If eye classification is not available, return false
+    if (leftEyeOpen == null || rightEyeOpen == null) {
+      return false;
+    }
+    
+    // Both eyes closed threshold: less than 30% open for both eyes
+    // This threshold is optimized for accurate drowsiness detection
+    return leftEyeOpen < 0.3 && rightEyeOpen < 0.3;
   }
   
   void stop() {

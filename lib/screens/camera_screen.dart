@@ -85,7 +85,7 @@ class _CameraScreenState extends State<CameraScreen> {
           }
           
           if (result.faces.isEmpty && !driverProvider.isDrowsy) {
-            driverProvider.setStatusMessage('No face detected');
+            driverProvider.setStatusMessage('👤 No face detected - Position face in frame');
           }
         });
       }
